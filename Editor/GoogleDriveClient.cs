@@ -7,7 +7,6 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
-using UnityEditor;
 using UnityEngine;
 
 namespace MyUnityHub
@@ -30,7 +29,8 @@ namespace MyUnityHub
 
     /// <summary>
     /// Google Drive v3 over plain HttpClient. OAuth2 loopback (PKCE) for a personal
-    /// Drive account; refresh token cached in EditorPrefs so login is one-time.
+    /// Drive account; refresh token round-trips through the .myhub credential file so
+    /// login is one-time.
     /// </summary>
     internal class GoogleDriveClient
     {
@@ -38,10 +38,12 @@ namespace MyUnityHub
         const string Token = "https://oauth2.googleapis.com/token";
         const string Api = "https://www.googleapis.com/drive/v3";
         const string Upload = "https://www.googleapis.com/upload/drive/v3";
-        const string Scope = "https://www.googleapis.com/auth/drive";
+        // Least privilege: readonly covers listing/downloading folders the user already
+        // owns; drive.file covers files/folders this tool creates (uploads). Full "drive"
+        // is not needed. Existing refresh tokens keep their old scope until re-login.
+        const string Scope = "https://www.googleapis.com/auth/drive.readonly " +
+                             "https://www.googleapis.com/auth/drive.file";
         const string FolderMime = "application/vnd.google-apps.folder";
-
-        const string RefreshKey = "DriveGitHubHub.refresh_token";
 
         static readonly HttpClient Http = new HttpClient();
 
@@ -51,11 +53,12 @@ namespace MyUnityHub
         string _refreshToken;
         DateTime _accessExpiry = DateTime.MinValue;
 
-        public GoogleDriveClient(string clientId, string clientSecret)
+        /// <summary>Secrets come from the attached .myhub file, never from EditorPrefs.</summary>
+        public GoogleDriveClient(Credentials creds)
         {
-            _clientId = clientId;
-            _clientSecret = clientSecret;
-            _refreshToken = EditorPrefs.GetString(RefreshKey, ""); // ctor runs on main thread (UI)
+            _clientId = creds.ClientId;
+            _clientSecret = creds.ClientSecret;
+            _refreshToken = creds.RefreshToken;
         }
 
         public bool HasSavedLogin => !string.IsNullOrEmpty(_refreshToken);
@@ -64,15 +67,11 @@ namespace MyUnityHub
         {
             _refreshToken = "";
             _accessToken = null;
-            EditorPrefs.DeleteKey(RefreshKey);
+            CredentialStore.SetRefreshToken("");
         }
 
         /// <summary>Explicit login button entry point: runs/refreshes OAuth now.</summary>
         public Task Login() => EnsureToken();
-
-        // EditorPrefs is main-thread only; marshal writes (we run inside Task.Run).
-        static void PersistRefresh(string token) =>
-            EditorDispatcher.Enqueue(() => EditorPrefs.SetString(RefreshKey, token));
 
         // ---- auth ----------------------------------------------------------
 
@@ -84,7 +83,7 @@ namespace MyUnityHub
             {
                 if (await TryRefresh(_refreshToken)) return;
                 _refreshToken = ""; // stale/revoked -> full login
-                EditorDispatcher.Enqueue(() => EditorPrefs.DeleteKey(RefreshKey));
+                CredentialStore.SetRefreshToken("");
             }
             await LoopbackLogin();
         }
@@ -98,7 +97,7 @@ namespace MyUnityHub
                 ["refresh_token"] = refresh,
                 ["grant_type"] = "refresh_token",
             };
-            var resp = await Http.PostAsync(Token, new FormUrlEncodedContent(form));
+            using var resp = await Http.PostAsync(Token, new FormUrlEncodedContent(form));
             if (!resp.IsSuccessStatusCode) return false;
             var tok = JsonUtility.FromJson<TokenResponse>(await resp.Content.ReadAsStringAsync());
             ApplyToken(tok);
@@ -112,7 +111,8 @@ namespace MyUnityHub
             string redirect = $"http://localhost:{port}/";
 
             string verifier = RandUrl(64);
-            string challenge = Base64Url(SHA256.Create().ComputeHash(Encoding.ASCII.GetBytes(verifier)));
+            using var sha = SHA256.Create();
+            string challenge = Base64Url(sha.ComputeHash(Encoding.ASCII.GetBytes(verifier)));
             string state = RandUrl(16);
 
             string url = $"{Auth}?response_type=code&client_id={Uri.EscapeDataString(_clientId)}" +
@@ -123,7 +123,9 @@ namespace MyUnityHub
             using var listener = new HttpListener();
             listener.Prefixes.Add(redirect);
             listener.Start();
-            Application.OpenURL(url);
+            // OpenURL is a Unity API: main thread only. Auth can be driven from a
+            // background task (ListFolder etc. call EnsureToken off-thread).
+            EditorDispatcher.Enqueue(() => Application.OpenURL(url));
 
             var ctx = await listener.GetContextAsync();
             string code = ctx.Request.QueryString["code"];
@@ -147,14 +149,16 @@ namespace MyUnityHub
                 ["grant_type"] = "authorization_code",
                 ["redirect_uri"] = redirect,
             };
-            var resp = await Http.PostAsync(Token, new FormUrlEncodedContent(form));
-            resp.EnsureSuccessStatusCode();
-            var tok = JsonUtility.FromJson<TokenResponse>(await resp.Content.ReadAsStringAsync());
+            using var resp = await Http.PostAsync(Token, new FormUrlEncodedContent(form));
+            string tokenBody = await resp.Content.ReadAsStringAsync();
+            if (!resp.IsSuccessStatusCode)
+                throw new Exception($"{(int)resp.StatusCode} {resp.ReasonPhrase}: {tokenBody}");
+            var tok = JsonUtility.FromJson<TokenResponse>(tokenBody);
             ApplyToken(tok);
             if (!string.IsNullOrEmpty(tok.refresh_token))
             {
                 _refreshToken = tok.refresh_token;
-                PersistRefresh(tok.refresh_token);
+                CredentialStore.SetRefreshToken(tok.refresh_token); // back into the .myhub file
             }
         }
 
@@ -174,11 +178,14 @@ namespace MyUnityHub
         /// <summary>Send + surface the API error body (Drive packs the real reason there).</summary>
         static async Task<string> SendChecked(HttpRequestMessage req)
         {
-            var resp = await Http.SendAsync(req);
-            string body = await resp.Content.ReadAsStringAsync();
-            if (!resp.IsSuccessStatusCode)
-                throw new Exception($"{(int)resp.StatusCode} {resp.ReasonPhrase}: {body}");
-            return body;
+            using (req)
+            using (var resp = await Http.SendAsync(req))
+            {
+                string body = await resp.Content.ReadAsStringAsync();
+                if (!resp.IsSuccessStatusCode)
+                    throw new Exception($"{(int)resp.StatusCode} {resp.ReasonPhrase}: {body}");
+                return body;
+            }
         }
 
         // ---- listing -------------------------------------------------------
@@ -208,12 +215,15 @@ namespace MyUnityHub
         public async Task DownloadFile(string id, string destPath)
         {
             await EnsureToken();
-            var resp = await Http.SendAsync(Req(HttpMethod.Get, $"{Api}/files/{id}?alt=media&supportsAllDrives=true"));
+            using var req = Req(HttpMethod.Get, $"{Api}/files/{id}?alt=media&supportsAllDrives=true");
+            // ResponseHeadersRead + stream copy: never hold a whole asset in memory.
+            using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
             if (!resp.IsSuccessStatusCode)
                 throw new Exception($"{(int)resp.StatusCode}: {await resp.Content.ReadAsStringAsync()}");
-            var bytes = await resp.Content.ReadAsByteArrayAsync();
             Directory.CreateDirectory(Path.GetDirectoryName(destPath));
-            File.WriteAllBytes(destPath, bytes);
+            using var src = await resp.Content.ReadAsStreamAsync();
+            using var dst = File.Create(destPath);
+            await src.CopyToAsync(dst);
         }
 
         /// <summary>Recursively download a Drive folder into destDir/folderName.</summary>

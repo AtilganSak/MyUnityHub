@@ -13,18 +13,10 @@ namespace MyUnityHub
     /// </summary>
     public class HubWindow : EditorWindow
     {
-        // ---- persisted settings (EditorPrefs) ------------------------------
-        const string K_ClientId = "DriveGitHubHub.clientId";
-        const string K_Secret   = "DriveGitHubHub.clientSecret";
-        const string K_RootId   = "DriveGitHubHub.rootFolderId";
-        const string K_Pat      = "DriveGitHubHub.githubPat";
-        const string K_DriveItems = "DriveGitHubHub.driveItems";
-        const string K_Repos      = "DriveGitHubHub.repos";
-
-        // fetched lists are project-specific (rootId differs per project)
-        static string PKey(string k) => k + "_" + Application.dataPath.GetHashCode();
-
-        string _clientId, _secret, _rootId, _pat;
+        // No credential ever lives in EditorPrefs. Everything comes from the attached
+        // .myhub file (see CredentialStore); the editor remembers only its path.
+        Credentials _creds;
+        string _credsError;
 
         // ---- runtime state -------------------------------------------------
         enum Tab { Drive, GitHub }
@@ -50,30 +42,76 @@ namespace MyUnityHub
 
         List<Repo> _repos;
 
-        [MenuItem("Tools/MyUnityHub")]
+        // Unity cannot have "Tools/MyUnityHub" be both a command and the parent of the
+        // helper items, so everything lives one level down. Priority gaps of 10+ draw
+        // separators between the groups.
+        [MenuItem("Tools/MyUnityHub/Open", false, 0)]
         public static void Open() => GetWindow<HubWindow>("MyUnityHub");
 
         void OnEnable()
         {
-            _clientId = EditorPrefs.GetString(K_ClientId, "");
-            _secret   = EditorPrefs.GetString(K_Secret, "");
-            _rootId   = EditorPrefs.GetString(K_RootId, "");
-            _pat      = EditorPrefs.GetString(K_Pat, "");
-            // open settings page first run if creds missing
-            _view = (string.IsNullOrEmpty(_clientId) || string.IsNullOrEmpty(_pat)) ? View.Settings : View.Main;
+            _view = View.Main;
+            ReloadCredentials();
             LoadCachedLists();
         }
 
+        /// <summary>Pull every open hub window back in sync after something outside it
+        /// (the wizard) changed which file is attached.</summary>
+        internal static void ReloadAllOpen()
+        {
+            foreach (var w in Resources.FindObjectsOfTypeAll<HubWindow>())
+            {
+                w.ReloadCredentials();
+                w.SafeRepaint();
+            }
+        }
+
+        /// <summary>Re-read the .myhub file. Runs on every domain reload, so an edit to
+        /// the file is picked up by saving a script or hitting 'Reload'.</summary>
+        void ReloadCredentials()
+        {
+            _drive = null; _github = null; // clients hold a copy of the old secrets
+            _creds = null;
+            _credsError = null;
+            if (!CredentialStore.IsAttached) return;
+            try { _creds = CredentialStore.Load(); }
+            catch (System.Exception e) { _credsError = e.Message; }
+
+            // A valid but still-empty file (a fresh template) is best explained on the
+            // settings page, where the missing keys are listed.
+            if (_creds != null && !_creds.HasGoogle && !_creds.HasGithub) _view = View.Settings;
+        }
+
         // ---- persistent list cache (survives editor restart / domain reload) ----
+        // Library/ instead of EditorPrefs: the lists can be hundreds of KB, which is
+        // past what EditorPrefs (Windows registry) reliably stores, and Library is
+        // already per-project and not version-controlled.
+        static string CacheDir =>
+            Path.Combine(Path.GetDirectoryName(Application.dataPath), "Library", "MyUnityHub");
+
+        static string CachePath(string name) => Path.Combine(CacheDir, name + ".json");
+
+        static void WriteCache(string name, string json)
+        {
+            Directory.CreateDirectory(CacheDir);
+            File.WriteAllText(CachePath(name), json);
+        }
+
+        static string ReadCache(string name)
+        {
+            string p = CachePath(name);
+            return File.Exists(p) ? File.ReadAllText(p) : null;
+        }
+
         void LoadCachedLists()
         {
-            var d = EditorPrefs.GetString(PKey(K_DriveItems), "");
+            var d = ReadCache("driveItems");
             if (!string.IsNullOrEmpty(d))
             {
                 var w = JsonUtility.FromJson<DriveFileList>(d);
                 if (w?.files != null) _driveItems = w.files.ToList();
             }
-            var r = EditorPrefs.GetString(PKey(K_Repos), "");
+            var r = ReadCache("repos");
             if (!string.IsNullOrEmpty(r))
             {
                 var w = JsonUtility.FromJson<RepoArrayWrap>(r);
@@ -82,16 +120,29 @@ namespace MyUnityHub
         }
 
         void SaveDriveItems() =>
-            EditorPrefs.SetString(PKey(K_DriveItems),
-                JsonUtility.ToJson(new DriveFileList { files = _driveItems.ToArray() }));
+            WriteCache("driveItems", JsonUtility.ToJson(new DriveFileList { files = _driveItems.ToArray() }));
 
         void SaveRepos() =>
-            EditorPrefs.SetString(PKey(K_Repos),
-                JsonUtility.ToJson(new RepoArrayWrap { items = _repos.ToArray() }));
+            WriteCache("repos", JsonUtility.ToJson(new RepoArrayWrap { items = _repos.ToArray() }));
 
         void OnDisable()
         {
-            if (_busy) EditorApplication.update -= Repaint; // drop the animation pump
+            EditorApplication.update -= SafeRepaint; // drop the animation pump
+        }
+
+        // An in-flight op can outlive the window (user closes it mid-download); the
+        // continuations must not touch a destroyed EditorWindow.
+        void OnDestroy() => _closed = true;
+        bool _closed;
+
+        void SafeRepaint()
+        {
+            if (_closed || this == null)
+            {
+                EditorApplication.update -= SafeRepaint;
+                return;
+            }
+            Repaint();
         }
 
         // ---- busy / progress ----------------------------------------------
@@ -99,23 +150,26 @@ namespace MyUnityHub
         void BeginBusy(int total)
         {
             _busy = true; _progTotal = total; _progDone = 0;
-            EditorApplication.update += Repaint; // pump repaints so the bar animates
-            Repaint();
+            EditorApplication.update += SafeRepaint; // pump repaints so the bar animates
+            SafeRepaint();
         }
 
         void EndBusy()
         {
             _busy = false; _progTotal = 0; _progDone = 0;
-            EditorApplication.update -= Repaint;
-            Repaint();
+            EditorApplication.update -= SafeRepaint;
+            SafeRepaint();
         }
 
-        GoogleDriveClient Drive => _drive ??= new GoogleDriveClient(_clientId, _secret);
-        GitHubClient GitHub => _github ??= new GitHubClient(_pat);
+        GoogleDriveClient Drive => _drive ??= new GoogleDriveClient(_creds);
+        GitHubClient GitHub => _github ??= new GitHubClient(_creds.GithubPat);
 
         // ===================================================================
         void OnGUI()
         {
+            // Nothing works without the credential file, so that screen wins over
+            // every other view.
+            if (_creds == null) { DrawAttachPage(); return; }
             if (_view == View.Settings) { DrawSettingsPage(); return; }
 
             // top bar
@@ -123,9 +177,9 @@ namespace MyUnityHub
             {
                 GUILayout.Label("MyUnityHub", EditorStyles.boldLabel);
                 GUILayout.FlexibleSpace();
-                if (Drive.HasSavedLogin) DrawGreenBadge("● Drive bağlı");
+                if (Drive.HasSavedLogin) DrawGreenBadge("● Drive connected");
                 using (new EditorGUI.DisabledScope(_busy))
-                    if (GUILayout.Button("⚙ Ayarlar", EditorStyles.toolbarButton, GUILayout.Width(90)))
+                    if (GUILayout.Button("⚙ Settings", EditorStyles.toolbarButton, GUILayout.Width(90)))
                         _view = View.Settings;
             }
 
@@ -158,7 +212,121 @@ namespace MyUnityHub
             float v = _progTotal > 0
                 ? (float)_progDone / _progTotal
                 : (float)(EditorApplication.timeSinceStartup % 1.0); // indeterminate sweep
-            EditorGUI.ProgressBar(r, v, string.IsNullOrEmpty(_status) ? "İşlem sürüyor..." : _status);
+            EditorGUI.ProgressBar(r, v, string.IsNullOrEmpty(_status) ? "Working..." : _status);
+        }
+
+        // ---- credential file attach page -----------------------------------
+        void DrawAttachPage()
+        {
+            using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
+                GUILayout.Label("MyUnityHub - Credential File", EditorStyles.boldLabel);
+
+            EditorGUILayout.Space();
+
+            if (_credsError != null)
+                EditorGUILayout.HelpBox("Could not read the credential file:\n" + _credsError,
+                    MessageType.Error);
+            else
+                EditorGUILayout.HelpBox(
+                    "Credentials are not kept in the editor. They are read from a " +
+                    $".{CredentialStore.Extension} file.\n\n" +
+                    "• Already have one: Select Credential File\n" +
+                    "• Don't have one: New Credential File (type the values, they go to the file)",
+                    MessageType.Info);
+
+            EditorGUILayout.Space();
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Select Credential File...", GUILayout.Height(28)))
+                    PickCredentialFile();
+                if (GUILayout.Button("New Credential File...", GUILayout.Height(28)))
+                    CredentialFileWizard.Open();
+            }
+
+            string path = CredentialStore.FilePath;
+            if (!string.IsNullOrEmpty(path))
+            {
+                EditorGUILayout.Space();
+                EditorGUILayout.LabelField("Selected file", path, EditorStyles.wordWrappedMiniLabel);
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    if (GUILayout.Button("Reload")) ReloadCredentialsFromUI();
+                    if (GUILayout.Button("Detach")) DetachCredentialFile();
+                }
+            }
+
+            DrawLegacyWarning();
+            EditorGUILayout.Space();
+            DrawFooter();
+        }
+
+        /// <summary>Older versions kept secrets in EditorPrefs. Keep nagging until they
+        /// are out of there, whichever page the user is on.</summary>
+        void DrawLegacyWarning()
+        {
+            if (!CredentialStore.HasLegacyPrefs) return;
+            EditorGUILayout.Space();
+            EditorGUILayout.HelpBox(
+                "Credentials from an older version are still in Unity's settings " +
+                "(EditorPrefs). Move them into a file, or delete them.", MessageType.Warning);
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Move to File and Erase")) MigrateLegacy();
+                if (GUILayout.Button("Erase Only")) ClearLegacy();
+            }
+        }
+
+        void ClearLegacy()
+        {
+            if (!EditorUtility.DisplayDialog("Erase old credentials",
+                    "The old Client ID / Secret / PAT / refresh token will be permanently " +
+                    "deleted from Unity's settings. Continue?", "Erase", "Cancel"))
+                return;
+            CredentialStore.ClearLegacyPrefs();
+            _status = "Old credentials erased from Unity's settings.";
+            GUIUtility.ExitGUI();
+        }
+
+        // Every one of these can flip which page OnGUI should be drawing, so they end
+        // with ExitGUI: continuing the current pass would mismatch Layout and Repaint.
+        // ExitGUI throws, so it must stay outside the try blocks below.
+
+        void PickCredentialFile()
+        {
+            string p = EditorUtility.OpenFilePanel("Select Credential File", "", CredentialStore.Extension);
+            if (string.IsNullOrEmpty(p)) return;
+            CredentialStore.FilePath = p;
+            ReloadCredentials();
+            if (_creds != null) _status = "Credential file loaded.";
+            GUIUtility.ExitGUI();
+        }
+
+        void MigrateLegacy()
+        {
+            string p = EditorUtility.SaveFilePanel("Save Old Credentials",
+                "", "myunityhub." + CredentialStore.Extension, CredentialStore.Extension);
+            if (string.IsNullOrEmpty(p)) return;
+            try
+            {
+                CredentialStore.MigrateLegacyPrefsTo(p);
+                ReloadCredentials();
+                _status = "Old credentials moved to the file and erased from Unity's settings.";
+            }
+            catch (System.Exception e) { _credsError = e.Message; }
+            GUIUtility.ExitGUI();
+        }
+
+        void DetachCredentialFile()
+        {
+            CredentialStore.Detach();
+            ReloadCredentials();
+            GUIUtility.ExitGUI();
+        }
+
+        void ReloadCredentialsFromUI()
+        {
+            ReloadCredentials();
+            GUIUtility.ExitGUI();
         }
 
         // ---- settings page -------------------------------------------------
@@ -167,60 +335,77 @@ namespace MyUnityHub
             using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
             {
                 using (new EditorGUI.DisabledScope(_busy))
-                    if (GUILayout.Button("← Geri", EditorStyles.toolbarButton, GUILayout.Width(70)))
+                    if (GUILayout.Button("← Back", EditorStyles.toolbarButton, GUILayout.Width(70)))
                         _view = View.Main;
-                GUILayout.Label("Ayarlar / Kimlik Bilgileri", EditorStyles.boldLabel);
+                GUILayout.Label("Settings / Credentials", EditorStyles.boldLabel);
             }
             EditorGUILayout.Space();
             using (new EditorGUI.DisabledScope(_busy))
                 DrawSettingsBody();
-            if (_busy) ProgressBarLine(); // only operation progress here, no idle status
+            EditorGUILayout.Space();
+            DrawFooter();
         }
 
         void DrawSettingsBody()
         {
-            bool loggedIn = Drive.HasSavedLogin;
-            if (loggedIn) DrawGreenBadge("● Google Drive: Giriş yapıldı");
+            string path = CredentialStore.FilePath;
 
-            // all fields always visible, masked as *
-            EditorGUI.BeginChangeCheck();
-            _clientId = EditorGUILayout.PasswordField("Google Client ID", _clientId);
-            _secret   = EditorGUILayout.PasswordField("Google Client Secret", _secret);
-            _rootId   = EditorGUILayout.PasswordField("Drive Root Folder ID", _rootId);
-            _pat      = EditorGUILayout.PasswordField("GitHub PAT", _pat);
-            if (EditorGUI.EndChangeCheck())
+            EditorGUILayout.LabelField("Credential file", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(path, EditorStyles.wordWrappedMiniLabel);
+
+            if (CredentialStore.IsInsideProject(path))
+                EditorGUILayout.HelpBox(
+                    "This file is inside the Unity project. Move it outside so it cannot " +
+                    "be committed by accident.", MessageType.Warning);
+
+            // Values are shown as present/absent only - the point of the file is that
+            // secrets never appear in the editor.
+            EditorGUILayout.LabelField("Google Client ID / Secret", Mark(_creds.HasGoogle));
+            EditorGUILayout.LabelField("Drive Root Folder ID", Mark(_creds.RootFolderId.Length > 0));
+            EditorGUILayout.LabelField("GitHub PAT", Mark(_creds.HasGithub));
+
+            using (new EditorGUILayout.HorizontalScope())
             {
-                EditorPrefs.SetString(K_ClientId, _clientId);
-                EditorPrefs.SetString(K_Secret, _secret);
-                EditorPrefs.SetString(K_RootId, _rootId);
-                EditorPrefs.SetString(K_Pat, _pat);
-                _drive = null; _github = null; // rebuild clients with new creds
+                if (GUILayout.Button("Reload")) ReloadCredentialsFromUI();
+                if (GUILayout.Button("Reveal")) EditorUtility.RevealInFinder(path);
+                if (GUILayout.Button("Select Other...")) PickCredentialFile();
+                if (GUILayout.Button("Detach")) DetachCredentialFile();
             }
 
             EditorGUILayout.Space();
+            bool loggedIn = Drive.HasSavedLogin;
+            if (loggedIn) DrawGreenBadge("● Google Drive: signed in");
+
             using (new EditorGUILayout.HorizontalScope())
             {
-                GUI.enabled = !_busy && !string.IsNullOrEmpty(_clientId) && !string.IsNullOrEmpty(_secret);
-                if (GUILayout.Button("Google ile Giriş Yap")) _ = DoLogin();
-                GUI.enabled = !_busy;
-                if (loggedIn && GUILayout.Button("Çıkış Yap"))
+                using (new EditorGUI.DisabledScope(!_creds.HasGoogle))
+                    if (GUILayout.Button("Sign in with Google")) _ = DoLogin();
+                if (loggedIn && GUILayout.Button("Sign out"))
                 {
                     Drive.SignOut();
-                    _status = "Drive oturumu temizlendi.";
+                    ReloadCredentials(); // the refresh token line is gone from the file
+                    _status = "Drive session cleared.";
                 }
             }
+
+            DrawLegacyWarning();
         }
+
+        static string Mark(bool set) => set ? "✔ present in file" : "✘ missing from file";
 
         async Task DoLogin()
         {
+            // Same rule as LoadDrive: build the client on the main thread, run the HTTP
+            // work off it so the editor stays live.
+            var drive = Drive;
             BeginBusy(0);
             try
             {
-                _status = "Google girişi açılıyor (tarayıcı)...";
-                await Drive.Login();
-                _status = "Google Drive bağlandı.";
+                _status = "Opening the Google sign-in page in your browser...";
+                await Task.Run(() => drive.Login());
+                _status = "Google Drive connected.";
             }
-            catch (System.Exception e) { _status = "Giriş hata: " + e.Message; }
+            catch (System.Exception e) { _status = "Sign-in failed: " + e.Message; }
             finally { EndBusy(); }
         }
 
@@ -247,7 +432,9 @@ namespace MyUnityHub
 
             if (_driveItems == null)
             {
-                EditorGUILayout.HelpBox("Root Folder ID gir ve 'Refresh List' bas.", MessageType.None);
+                EditorGUILayout.HelpBox(
+                    "Set drive.rootFolderId in the credential file, then hit 'Refresh List'.",
+                    MessageType.None);
                 return;
             }
 
@@ -274,34 +461,39 @@ namespace MyUnityHub
             EditorGUILayout.Space();
             using (new EditorGUILayout.HorizontalScope())
             {
-                GUI.enabled = !_busy && _selectedFiles.Count > 0;
-                if (GUILayout.Button($"Import {_selectedFiles.Count} File(s)")) _ = ImportFiles();
-                GUI.enabled = !_busy && _selectedFolderId != null;
-                if (GUILayout.Button("Import Selected Folder")) _ = ImportFolder();
-                GUI.enabled = !_busy;
+                using (new EditorGUI.DisabledScope(_selectedFiles.Count == 0))
+                    if (GUILayout.Button($"Import {_selectedFiles.Count} File(s)")) _ = ImportFiles();
+                using (new EditorGUI.DisabledScope(_selectedFolderId == null))
+                    if (GUILayout.Button("Import Selected Folder")) _ = ImportFolder();
             }
         }
 
         async Task LoadDrive(bool force)
         {
-            if (string.IsNullOrEmpty(_rootId)) { _status = "Root Folder ID bos."; Repaint(); return; }
+            string rootId = _creds.RootFolderId;
+            if (string.IsNullOrEmpty(rootId))
+            {
+                _status = "drive.rootFolderId is empty in the credential file.";
+                SafeRepaint();
+                return;
+            }
             BeginBusy(0);
             try
             {
-                _status = "Drive listeleniyor...";
-                if (force || !_driveCache.TryGet(_rootId, out _driveItems))
+                _status = "Listing Drive...";
+                if (force || !_driveCache.TryGet(rootId, out _driveItems))
                 {
-                    // Materialize client on main thread (ctor reads EditorPrefs), then
-                    // Task.Run: HttpClient's sync prelude (proxy/DNS) must stay off the
-                    // main thread or the editor freezes.
+                    // Materialize the client on the main thread, then Task.Run:
+                    // HttpClient's sync prelude (proxy/DNS) must stay off the main
+                    // thread or the editor freezes.
                     var drive = Drive;
-                    _driveItems = await Task.Run(() => drive.ListFolder(_rootId));
-                    _driveCache.Set(_rootId, _driveItems);
+                    _driveItems = await Task.Run(() => drive.ListFolder(rootId));
+                    _driveCache.Set(rootId, _driveItems);
                 }
                 SaveDriveItems(); // persist across editor restarts
-                _status = $"{_driveItems.Count} oge.";
+                _status = $"{_driveItems.Count} item(s).";
             }
-            catch (System.Exception e) { _status = "Drive hata: " + e.Message; }
+            catch (System.Exception e) { _status = "Drive error: " + e.Message; }
             finally { EndBusy(); }
         }
 
@@ -319,13 +511,13 @@ namespace MyUnityHub
                 if (File.Exists(path))
                 {
                     int c = EditorUtility.DisplayDialogComplex("Conflict",
-                        $"'{f.name}' zaten var.", "Overwrite", "Cancel", "Skip");
+                        $"'{f.name}' already exists.", "Overwrite", "Cancel", "Skip");
                     if (c == 1) return;     // Cancel whole batch
                     if (c == 2) continue;   // Skip
                 }
                 jobs.Add((f, path));
             }
-            if (jobs.Count == 0) { _status = "Indirilecek dosya yok."; Repaint(); return; }
+            if (jobs.Count == 0) { _status = "Nothing to download."; SafeRepaint(); return; }
 
             // batch: freeze compilation until all files land, then one import.
             var drive = Drive;
@@ -335,14 +527,14 @@ namespace MyUnityHub
             {
                 foreach (var (f, path) in jobs)
                 {
-                    _status = $"İndiriliyor {_progDone + 1}/{jobs.Count}: {f.name}";
+                    _status = $"Downloading {_progDone + 1}/{jobs.Count}: {f.name}";
                     await Task.Run(() => drive.DownloadFile(f.id, path));
                     _progDone++;
                 }
-                _status = $"{jobs.Count} dosya alındı.";
+                _status = $"{jobs.Count} file(s) imported.";
                 _selectedFiles.Clear();
             }
-            catch (System.Exception e) { _status = "Indirme hata: " + e.Message; }
+            catch (System.Exception e) { _status = "Download error: " + e.Message; }
             finally
             {
                 AssetDatabase.StopAssetEditing();
@@ -360,8 +552,17 @@ namespace MyUnityHub
             if (Directory.Exists(dest))
             {
                 int c = EditorUtility.DisplayDialogComplex("Conflict",
-                    $"'{folder.name}' klasoru zaten var.", "Overwrite", "Cancel", "Skip");
-                if (c != 0) { _status = "Iptal/atlandi."; return; } // only overwrite proceeds
+                    $"Folder '{folder.name}' already exists.\n\n" +
+                    "Overwrite: the existing folder is DELETED and downloaded again.",
+                    "Overwrite", "Cancel", "Skip");
+                if (c != 0) { _status = "Cancelled/skipped."; return; } // only overwrite proceeds
+                // A plain re-download would leave files that no longer exist on Drive.
+                // DeleteAsset (not Directory.Delete) so the .meta files go too.
+                if (!AssetDatabase.DeleteAsset(ToAssetPath(dest)))
+                {
+                    _status = "Could not delete the existing folder: " + dest;
+                    return;
+                }
             }
 
             var drive = Drive;
@@ -369,11 +570,11 @@ namespace MyUnityHub
             AssetDatabase.StartAssetEditing();
             try
             {
-                _status = $"Klasör indiriliyor: {folder.name}";
+                _status = $"Downloading folder: {folder.name}";
                 await Task.Run(() => drive.DownloadFolder(folder, dir));
-                _status = $"Klasör alındı: {folder.name}";
+                _status = $"Folder imported: {folder.name}";
             }
-            catch (System.Exception e) { _status = "Indirme hata: " + e.Message; }
+            catch (System.Exception e) { _status = "Download error: " + e.Message; }
             finally
             {
                 AssetDatabase.StopAssetEditing();
@@ -384,7 +585,12 @@ namespace MyUnityHub
 
         async Task UploadLocal(bool folder)
         {
-            if (string.IsNullOrEmpty(_rootId)) { _status = "Root Folder ID bos (upload hedefi)."; return; }
+            string rootId = _creds.RootFolderId;
+            if (string.IsNullOrEmpty(rootId))
+            {
+                _status = "drive.rootFolderId is empty in the credential file (upload target).";
+                return;
+            }
             string path = folder
                 ? EditorUtility.OpenFolderPanel("Upload Folder", Application.dataPath, "")
                 : EditorUtility.OpenFilePanel("Upload File", Application.dataPath, "");
@@ -393,13 +599,13 @@ namespace MyUnityHub
             BeginBusy(0);
             try
             {
-                _status = folder ? "Klasör yükleniyor..." : "Dosya yükleniyor...";
-                if (folder) await Task.Run(() => drive.UploadFolder(path, _rootId));
-                else await Task.Run(() => drive.UploadFile(path, _rootId));
-                _status = "Yüklendi.";
+                _status = folder ? "Uploading folder..." : "Uploading file...";
+                if (folder) await Task.Run(() => drive.UploadFolder(path, rootId));
+                else await Task.Run(() => drive.UploadFile(path, rootId));
+                _status = "Uploaded.";
                 _driveCache.Clear();
             }
-            catch (System.Exception e) { _status = "Upload hata: " + e.Message; }
+            catch (System.Exception e) { _status = "Upload error: " + e.Message; }
             finally { EndBusy(); }
         }
 
@@ -414,7 +620,9 @@ namespace MyUnityHub
             }
             if (_repos == null)
             {
-                EditorGUILayout.HelpBox("PAT gir ve 'Refresh Repos' bas.", MessageType.None);
+                EditorGUILayout.HelpBox(
+                    "Set github.pat in the credential file, then hit 'Refresh Repos'.",
+                    MessageType.None);
                 return;
             }
 
@@ -431,49 +639,64 @@ namespace MyUnityHub
 
         async Task LoadRepos(bool force)
         {
+            if (!_creds.HasGithub)
+            {
+                _status = "github.pat is empty in the credential file.";
+                SafeRepaint();
+                return;
+            }
             BeginBusy(0);
             try
             {
-                _status = "Repolar listeleniyor...";
+                _status = "Listing repos...";
                 if (force || !_repoCache.TryGet("repos", out _repos))
                 {
                     var gh = GitHub;
                     var repos = await Task.Run(() => gh.ListRepos());
-                    // probe package.json in parallel (capped naturally by repo count)
-                    await Task.Run(() => Task.WhenAll(repos.Select(gh.ProbeIsPackage)));
+                    await Task.Run(() => gh.ProbeIsPackages(repos)); // throttled to 8 in flight
                     // atomic swap: isPackage is mutated above; assigning only when fully
                     // populated keeps the drawn list stable between Layout/Repaint passes.
                     _repos = repos;
                     _repoCache.Set("repos", _repos);
                     SaveRepos(); // persist across editor restarts
                 }
-                _status = $"{_repos.Count(r => r.isPackage)} UPM paketi.";
+                _status = $"{_repos.Count(r => r.isPackage)} UPM package(s).";
             }
-            catch (System.Exception e) { _status = "GitHub hata: " + e.Message; }
+            catch (System.Exception e) { _status = "GitHub error: " + e.Message; }
             finally { EndBusy(); }
         }
 
         void AddUpm(Repo r)
         {
-            _status = $"UPM ekleniyor: {r.name}";
-            Repaint();
+            _status = $"Adding UPM package: {r.name}";
+            SafeRepaint();
             UpmInstaller.Add(r.GitUrl, (ok, msg) =>
             {
-                _status = ok ? $"Eklendi: {msg}" : $"UPM hata: {msg}";
-                Repaint();
+                _status = ok ? $"Added: {msg}" : $"UPM error: {msg}";
+                SafeRepaint();
             });
         }
 
         // ===================================================================
         // helpers
         // ===================================================================
+        static string Norm(string p) => p.Replace('\\', '/').TrimEnd('/');
+
+        /// <summary>"C:/proj/Assets/Foo" -> "Assets/Foo" (caller guarantees it is under Assets).</summary>
+        static string ToAssetPath(string absolute) =>
+            "Assets" + Norm(absolute).Substring(Norm(Application.dataPath).Length);
+
         string AskTargetDir()
         {
-            string dir = EditorUtility.OpenFolderPanel("Hedef Dizin (Assets icinde)", Application.dataPath, "");
+            string dir = EditorUtility.OpenFolderPanel("Target Folder (inside Assets)", Application.dataPath, "");
             if (string.IsNullOrEmpty(dir)) return null;
-            if (!dir.Replace('\\', '/').StartsWith(Application.dataPath.Replace('\\', '/')))
+            // Trailing separator matters: without it a sibling like ".../AssetsBackup"
+            // passes a bare StartsWith against ".../Assets".
+            string root = Norm(Application.dataPath);
+            string norm = Norm(dir);
+            if (norm != root && !norm.StartsWith(root + "/"))
             {
-                _status = "Hedef Assets klasoru icinde olmali.";
+                _status = "The target must be inside the Assets folder.";
                 return null;
             }
             return dir;
