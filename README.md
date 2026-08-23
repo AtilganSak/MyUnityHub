@@ -7,7 +7,6 @@ Editor window for Google Drive + GitHub/UPM workflows.
 |---|---|
 | **Tools ▸ MyUnityHub ▸ Open** | the hub window |
 | **Tools ▸ MyUnityHub ▸ New Credential File...** | credential file wizard |
-| **Tools ▸ MyUnityHub ▸ Run Credential Format Test** | self-check for the `.myhub` parser, logs to the console |
 
 ## Features
 - **Google Drive** (OAuth2 loopback login): list a root folder, import multiple files or one folder into `Assets/`, upload local files/folders back to Drive. Compile-batched (`StartAssetEditing`), conflict prompt per file (Overwrite/Skip/Cancel). Choosing Overwrite for a *folder* deletes the existing one and re-downloads, so files removed on Drive do not linger locally.
