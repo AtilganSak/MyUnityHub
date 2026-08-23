@@ -1,6 +1,6 @@
 {
   "name": "com.heatinteractive.myunityhub",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "displayName": "MyUnityHub",
   "description": "Editor window: import/upload scripts & folders to Google Drive (OAuth2) and add GitHub repos as UPM packages.",
   "unity": "2021.3",
