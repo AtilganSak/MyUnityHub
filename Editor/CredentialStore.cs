@@ -62,15 +62,31 @@ namespace MyUnityHub
 
         // ---- attachment ----------------------------------------------------
 
+        // EditorPrefs is main-thread only, but Upsert runs from the OAuth refresh on a
+        // background task. Read the path once per domain reload on the main thread and
+        // serve it from memory afterwards.
+        static string _pathCache;
+
+        [InitializeOnLoadMethod]
+        static void PrimePathCache() => _pathCache = EditorPrefs.GetString(K_Path, "");
+
         public static string FilePath
         {
-            get => EditorPrefs.GetString(K_Path, "");
-            set => EditorPrefs.SetString(K_Path, value ?? "");
+            get => _pathCache ??= EditorPrefs.GetString(K_Path, "");
+            set
+            {
+                _pathCache = value ?? "";
+                EditorPrefs.SetString(K_Path, _pathCache);
+            }
         }
 
         public static bool IsAttached => FilePath.Length > 0 && File.Exists(FilePath);
 
-        public static void Detach() => EditorPrefs.DeleteKey(K_Path);
+        public static void Detach()
+        {
+            _pathCache = "";
+            EditorPrefs.DeleteKey(K_Path);
+        }
 
         /// <summary>True if the file sits inside the Unity project, i.e. one careless
         /// commit away from being published.</summary>
@@ -170,16 +186,25 @@ namespace MyUnityHub
         static void WriteAtomic(string path, List<string> lines)
         {
             string tmp = path + ".tmp";
-            File.WriteAllLines(tmp, lines, new UTF8Encoding(false));
-            if (File.Exists(path)) File.Replace(tmp, path, null);
-            else File.Move(tmp, path);
+            try
+            {
+                File.WriteAllLines(tmp, lines, new UTF8Encoding(false));
+                if (File.Exists(path)) File.Replace(tmp, path, null);
+                else File.Move(tmp, path);
+            }
+            finally
+            {
+                // A failed write must not leave a half-finished .tmp beside the real file.
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* best effort */ }
+            }
         }
 
         /// <summary>Write a new credential file. Empty values still get their line and
         /// comment, so the result doubles as a fill-in-later template.</summary>
         public static void Create(string path, Credentials c)
         {
-            File.WriteAllLines(path, BuildFile(c), new UTF8Encoding(false));
+            var lines = BuildFile(c); // may throw on a bad value: do that before touching disk
+            lock (Gate) WriteAtomic(path, lines);
         }
 
         static List<string> BuildFile(Credentials c)

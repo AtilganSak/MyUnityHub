@@ -28,6 +28,7 @@ namespace MyUnityHub
         string _search = "";
 
         bool _busy;                 // an op is running -> whole window disabled
+        bool _reloadLocked;         // assembly reloads held off while an op runs
         int _progDone, _progTotal;  // _progTotal==0 => indeterminate (animated bar)
 
         GoogleDriveClient _drive;
@@ -128,6 +129,7 @@ namespace MyUnityHub
         void OnDisable()
         {
             EditorApplication.update -= SafeRepaint; // drop the animation pump
+            UnlockReloads();                         // never leave the lock behind
         }
 
         // An in-flight op can outlive the window (user closes it mid-download); the
@@ -150,6 +152,13 @@ namespace MyUnityHub
         void BeginBusy(int total)
         {
             _busy = true; _progTotal = total; _progDone = 0;
+            // A domain reload mid-operation kills the continuation and can strand
+            // AssetDatabase.StartAssetEditing, which leaves the whole project locked.
+            if (!_reloadLocked)
+            {
+                EditorApplication.LockReloadAssemblies();
+                _reloadLocked = true;
+            }
             EditorApplication.update += SafeRepaint; // pump repaints so the bar animates
             SafeRepaint();
         }
@@ -157,8 +166,16 @@ namespace MyUnityHub
         void EndBusy()
         {
             _busy = false; _progTotal = 0; _progDone = 0;
+            UnlockReloads();
             EditorApplication.update -= SafeRepaint;
             SafeRepaint();
+        }
+
+        void UnlockReloads()
+        {
+            if (!_reloadLocked) return;
+            _reloadLocked = false;
+            EditorApplication.UnlockReloadAssemblies();
         }
 
         GoogleDriveClient Drive => _drive ??= new GoogleDriveClient(_creds);
@@ -379,7 +396,7 @@ namespace MyUnityHub
             using (new EditorGUILayout.HorizontalScope())
             {
                 using (new EditorGUI.DisabledScope(!_creds.HasGoogle))
-                    if (GUILayout.Button("Sign in with Google")) _ = DoLogin();
+                    if (GUILayout.Button("Sign in with Google")) Defer(DoLogin);
                 if (loggedIn && GUILayout.Button("Sign out"))
                 {
                     Drive.SignOut();
@@ -425,9 +442,9 @@ namespace MyUnityHub
         {
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("Refresh List")) _ = LoadDrive(force: true);
-                if (GUILayout.Button("Upload File...")) _ = UploadLocal(folder: false);
-                if (GUILayout.Button("Upload Folder...")) _ = UploadLocal(folder: true);
+                if (GUILayout.Button("Refresh List")) Defer(() => LoadDrive(force: true));
+                if (GUILayout.Button("Upload File...")) Defer(() => UploadLocal(folder: false));
+                if (GUILayout.Button("Upload Folder...")) Defer(() => UploadLocal(folder: true));
             }
 
             if (_driveItems == null)
@@ -462,9 +479,9 @@ namespace MyUnityHub
             using (new EditorGUILayout.HorizontalScope())
             {
                 using (new EditorGUI.DisabledScope(_selectedFiles.Count == 0))
-                    if (GUILayout.Button($"Import {_selectedFiles.Count} File(s)")) _ = ImportFiles();
+                    if (GUILayout.Button($"Import {_selectedFiles.Count} File(s)")) Defer(ImportFiles);
                 using (new EditorGUI.DisabledScope(_selectedFolderId == null))
-                    if (GUILayout.Button("Import Selected Folder")) _ = ImportFolder();
+                    if (GUILayout.Button("Import Selected Folder")) Defer(ImportFolder);
             }
         }
 
@@ -555,12 +572,13 @@ namespace MyUnityHub
                     $"Folder '{folder.name}' already exists.\n\n" +
                     "Overwrite: the existing folder is DELETED and downloaded again.",
                     "Overwrite", "Cancel", "Skip");
-                if (c != 0) { _status = "Cancelled/skipped."; return; } // only overwrite proceeds
+                if (c != 0) { _status = "Cancelled/skipped."; SafeRepaint(); return; } // only overwrite
                 // A plain re-download would leave files that no longer exist on Drive.
                 // DeleteAsset (not Directory.Delete) so the .meta files go too.
                 if (!AssetDatabase.DeleteAsset(ToAssetPath(dest)))
                 {
                     _status = "Could not delete the existing folder: " + dest;
+                    SafeRepaint();
                     return;
                 }
             }
@@ -589,6 +607,7 @@ namespace MyUnityHub
             if (string.IsNullOrEmpty(rootId))
             {
                 _status = "drive.rootFolderId is empty in the credential file (upload target).";
+                SafeRepaint();
                 return;
             }
             string path = folder
@@ -616,7 +635,7 @@ namespace MyUnityHub
         {
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("Refresh Repos")) _ = LoadRepos(force: true);
+                if (GUILayout.Button("Refresh Repos")) Defer(() => LoadRepos(force: true));
             }
             if (_repos == null)
             {
@@ -680,6 +699,11 @@ namespace MyUnityHub
         // ===================================================================
         // helpers
         // ===================================================================
+        // Buttons fire inside OnGUI. Anything that opens a file panel or a modal dialog
+        // must not run in the middle of a Layout/Repaint pass, so the operation starts on
+        // the next editor tick instead.
+        static void Defer(System.Func<Task> op) => EditorDispatcher.Enqueue(() => _ = op());
+
         static string Norm(string p) => p.Replace('\\', '/').TrimEnd('/');
 
         /// <summary>"C:/proj/Assets/Foo" -> "Assets/Foo" (caller guarantees it is under Assets).</summary>

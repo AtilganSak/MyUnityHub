@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 
@@ -17,7 +18,6 @@ namespace MyUnityHub
         public string id;
         public string name;
         public string mimeType;
-        public string size;
         public bool IsFolder => mimeType == "application/vnd.google-apps.folder";
     }
 
@@ -44,6 +44,8 @@ namespace MyUnityHub
         const string Scope = "https://www.googleapis.com/auth/drive.readonly " +
                              "https://www.googleapis.com/auth/drive.file";
         const string FolderMime = "application/vnd.google-apps.folder";
+        // How long the loopback listener waits for the browser to come back.
+        static readonly TimeSpan LoginTimeout = TimeSpan.FromMinutes(2);
 
         static readonly HttpClient Http = new HttpClient();
 
@@ -75,17 +77,29 @@ namespace MyUnityHub
 
         // ---- auth ----------------------------------------------------------
 
+        bool TokenValid => !string.IsNullOrEmpty(_accessToken) && DateTime.UtcNow < _accessExpiry;
+
+        // Serialised: two concurrent callers would both miss the cached token and each
+        // start their own browser login.
+        readonly SemaphoreSlim _authGate = new SemaphoreSlim(1, 1);
+
         async Task EnsureToken()
         {
-            if (!string.IsNullOrEmpty(_accessToken) && DateTime.UtcNow < _accessExpiry) return;
-
-            if (!string.IsNullOrEmpty(_refreshToken))
+            if (TokenValid) return;
+            await _authGate.WaitAsync();
+            try
             {
-                if (await TryRefresh(_refreshToken)) return;
-                _refreshToken = ""; // stale/revoked -> full login
-                CredentialStore.SetRefreshToken("");
+                if (TokenValid) return; // someone else logged in while we waited
+
+                if (!string.IsNullOrEmpty(_refreshToken))
+                {
+                    if (await TryRefresh(_refreshToken)) return;
+                    _refreshToken = ""; // stale/revoked -> full login
+                    CredentialStore.SetRefreshToken("");
+                }
+                await LoopbackLogin();
             }
-            await LoopbackLogin();
+            finally { _authGate.Release(); }
         }
 
         async Task<bool> TryRefresh(string refresh)
@@ -127,18 +141,28 @@ namespace MyUnityHub
             // background task (ListFolder etc. call EnsureToken off-thread).
             EditorDispatcher.Enqueue(() => Application.OpenURL(url));
 
-            var ctx = await listener.GetContextAsync();
+            // Without a deadline the editor waits forever if the user closes the browser
+            // tab instead of finishing the consent screen.
+            var pending = listener.GetContextAsync();
+            if (await Task.WhenAny(pending, Task.Delay(LoginTimeout)) != pending)
+            {
+                Observe(pending); // disposing the listener below makes it throw
+                throw new TimeoutException(
+                    $"Google sign-in was not completed within {LoginTimeout.TotalMinutes:0} minutes.");
+            }
+
+            var ctx = await pending;
             string code = ctx.Request.QueryString["code"];
             string gotState = ctx.Request.QueryString["state"];
             byte[] body = Encoding.UTF8.GetBytes(
-                "<html><body><h3>Drive baglandi. Bu sekmeyi kapatabilirsin.</h3></body></html>");
+                "<html><body><h3>Drive connected. You can close this tab.</h3></body></html>");
             ctx.Response.ContentType = "text/html; charset=utf-8";
             ctx.Response.OutputStream.Write(body, 0, body.Length);
             ctx.Response.OutputStream.Close();
             listener.Stop();
 
             if (gotState != state) throw new Exception("OAuth state mismatch (CSRF).");
-            if (string.IsNullOrEmpty(code)) throw new Exception("OAuth code alinamadi.");
+            if (string.IsNullOrEmpty(code)) throw new Exception("No OAuth code in the callback.");
 
             var form = new Dictionary<string, string>
             {
@@ -199,7 +223,7 @@ namespace MyUnityHub
             {
                 string q = Uri.EscapeDataString($"'{folderId}' in parents and trashed=false");
                 string url = $"{Api}/files?q={q}&pageSize=200&orderBy=folder,name" +
-                             "&fields=nextPageToken,files(id,name,mimeType,size)" +
+                             "&fields=nextPageToken,files(id,name,mimeType)" +
                              "&supportsAllDrives=true&includeItemsFromAllDrives=true";
                 if (pageToken != null) url += "&pageToken=" + pageToken;
 
@@ -249,7 +273,9 @@ namespace MyUnityHub
             var content = new MultipartContent("related");
             var metaPart = new StringContent(meta, Encoding.UTF8, "application/json");
             content.Add(metaPart);
-            var filePart = new ByteArrayContent(File.ReadAllBytes(localPath));
+            // Stream instead of buffering: a large asset must not be pulled into memory
+            // whole. SendChecked disposes the request, which disposes this stream.
+            var filePart = new StreamContent(File.OpenRead(localPath));
             filePart.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
             content.Add(filePart);
 
@@ -299,6 +325,11 @@ namespace MyUnityHub
 
         static string Base64Url(byte[] b) =>
             Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+        /// <summary>Swallow the failure of a task we stopped waiting for, so it cannot
+        /// resurface later as an unobserved exception.</summary>
+        static void Observe(Task t) =>
+            t.ContinueWith(x => { _ = x.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
     }
 }
 
