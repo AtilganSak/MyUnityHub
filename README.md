@@ -101,24 +101,7 @@ to your whole Drive is not requested.
 Fetched Drive and repo lists are cached in `<project>/Library/MyUnityHub/`. Deleting
 that folder just forces a refresh.
 
-## Upgrading from 1.0.0
-**Credentials.** 1.0.0 kept them in `EditorPrefs` (Windows registry / macOS plist). If
-any are still there, the window warns and offers **Move to File and Erase** (write them
-into a `.myhub` and attach it) or **Erase Only**. Both erase the `EditorPrefs` entries.
-
-**Menu.** The window moved from **Tools ▸ MyUnityHub** to **Tools ▸ MyUnityHub ▸ Open**,
-to make room for the helper commands.
-
-**Drive scope.** 1.0.0 requested full `drive`. An existing session keeps that broad
-scope until you **Sign out** and sign in again.
-
-**List cache.** Also moved out of `EditorPrefs`, into `Library/MyUnityHub/`. Nothing to
-do; the first refresh rebuilds it.
-
 ## Install (as package)
 Package name: `com.heatinteractive.myunityhub`. Add it via Package Manager ▸
 *Add package from git URL* with this repo's git URL, or copy the folder into the
 target project's `Packages/`.
-
-## License
-MIT — see [LICENSE.md](LICENSE.md).
