@@ -9,7 +9,7 @@ Editor window for Google Drive + GitHub/UPM workflows.
 | **Tools ▸ MyUnityHub ▸ New Credential File...** | credential file wizard |
 
 ## Features
-- **Google Drive** (OAuth2 loopback login): list a root folder, import multiple files or one folder into `Assets/`, upload local files/folders back to Drive. Compile-batched (`StartAssetEditing`), conflict prompt per file (Overwrite/Skip/Cancel). Choosing Overwrite for a *folder* deletes the existing one and re-downloads, so files removed on Drive do not linger locally.
+- **Google Drive** (OAuth2 loopback login): browse the root folder as a recursive tree — folders open in place, and only a folder with something in it gets a triangle. Opening one lists it over the API; nothing is downloaded until you import. Tick anything at any depth — ticking a folder ticks everything inside it, and a folder holding a partial selection shows a dash. Import rebuilds the Drive layout under the target folder, so a file four levels down lands four levels down. Upload local files/folders back to Drive. Compile-batched (`StartAssetEditing`), conflict prompt per file (Overwrite/Skip/Cancel). Choosing Overwrite for a *folder* deletes the existing one and re-downloads, so files removed on Drive do not linger locally.
 - **GitHub / UPM**: list your repos, filter the ones with `package.json`, add them as UPM packages via `Client.Add` (writes the git URL into `manifest.json`). Probing is capped at 8 concurrent requests to stay under GitHub's secondary rate limit.
 - Credentials live in an external `.myhub` file, never in editor settings — see below.
 - Settings page (`⚙`), persistent list cache, progress bar, busy-lock.

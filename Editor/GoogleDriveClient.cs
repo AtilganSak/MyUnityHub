@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -15,10 +16,13 @@ namespace MyUnityHub
     [Serializable]
     public class DriveFile
     {
+        public const string FolderMimeType = "application/vnd.google-apps.folder";
+
         public string id;
         public string name;
         public string mimeType;
-        public bool IsFolder => mimeType == "application/vnd.google-apps.folder";
+        public string[] parents; // needed to sort children back under the right folder
+        public bool IsFolder => mimeType == FolderMimeType;
     }
 
     [Serializable]
@@ -43,7 +47,9 @@ namespace MyUnityHub
         // is not needed. Existing refresh tokens keep their old scope until re-login.
         const string Scope = "https://www.googleapis.com/auth/drive.readonly " +
                              "https://www.googleapis.com/auth/drive.file";
-        const string FolderMime = "application/vnd.google-apps.folder";
+        // Drive puts the whole query in the URL, so several parents are asked for per
+        // request but not all of them at once.
+        const int ParentsPerQuery = 40;
         // How long the loopback listener waits for the browser to come back.
         static readonly TimeSpan LoginTimeout = TimeSpan.FromMinutes(2);
 
@@ -223,7 +229,7 @@ namespace MyUnityHub
             {
                 string q = Uri.EscapeDataString($"'{folderId}' in parents and trashed=false");
                 string url = $"{Api}/files?q={q}&pageSize=200&orderBy=folder,name" +
-                             "&fields=nextPageToken,files(id,name,mimeType)" +
+                             "&fields=nextPageToken,files(id,name,mimeType,parents)" +
                              "&supportsAllDrives=true&includeItemsFromAllDrives=true";
                 if (pageToken != null) url += "&pageToken=" + pageToken;
 
@@ -232,6 +238,47 @@ namespace MyUnityHub
                 pageToken = list.nextPageToken;
             } while (!string.IsNullOrEmpty(pageToken));
             return all;
+        }
+
+        /// <summary>
+        /// List the children of several folders in one go. Drive exposes no "is this
+        /// folder empty" flag, so looking inside is the only way to know whether a folder
+        /// is worth a foldout arrow - asking for a whole level at a time keeps that to one
+        /// request per level instead of one per folder. Every requested id gets an entry,
+        /// empty when the folder has no children.
+        /// </summary>
+        public async Task<Dictionary<string, List<DriveFile>>> ListChildren(IList<string> folderIds)
+        {
+            var result = new Dictionary<string, List<DriveFile>>();
+            foreach (var id in folderIds) result[id] = new List<DriveFile>();
+            if (result.Count == 0) return result;
+
+            await EnsureToken();
+            for (int i = 0; i < folderIds.Count; i += ParentsPerQuery)
+            {
+                string clause = string.Join(" or ", folderIds.Skip(i).Take(ParentsPerQuery)
+                                                             .Select(id => $"'{id}' in parents"));
+                string pageToken = null;
+                do
+                {
+                    string q = Uri.EscapeDataString($"({clause}) and trashed=false");
+                    string url = $"{Api}/files?q={q}&pageSize=200&orderBy=folder,name" +
+                                 "&fields=nextPageToken,files(id,name,mimeType,parents)" +
+                                 "&supportsAllDrives=true&includeItemsFromAllDrives=true";
+                    if (pageToken != null) url += "&pageToken=" + pageToken;
+
+                    var list = JsonUtility.FromJson<DriveFileList>(await SendChecked(Req(HttpMethod.Get, url)));
+                    foreach (var file in list.files ?? new DriveFile[0])
+                    {
+                        // A file can sit in more than one folder. File it under the first
+                        // parent we asked about so the tree never shows it twice.
+                        string owner = file.parents?.FirstOrDefault(p => result.ContainsKey(p));
+                        if (owner != null) result[owner].Add(file);
+                    }
+                    pageToken = list.nextPageToken;
+                } while (!string.IsNullOrEmpty(pageToken));
+            }
+            return result;
         }
 
         // ---- download ------------------------------------------------------
@@ -298,7 +345,8 @@ namespace MyUnityHub
         {
             await EnsureToken();
             string meta = "{\"name\":\"" + name.Replace("\"", "\\\"") +
-                          "\",\"mimeType\":\"" + FolderMime + "\",\"parents\":[\"" + parentId + "\"]}";
+                          "\",\"mimeType\":\"" + DriveFile.FolderMimeType +
+                          "\",\"parents\":[\"" + parentId + "\"]}";
             var req = Req(HttpMethod.Post, $"{Api}/files?supportsAllDrives=true");
             req.Content = new StringContent(meta, Encoding.UTF8, "application/json");
             return JsonUtility.FromJson<DriveFile>(await SendChecked(req)).id;

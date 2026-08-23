@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -7,6 +8,29 @@ using UnityEngine;
 
 namespace MyUnityHub
 {
+    /// <summary>One row of the Drive tree. Lives in memory only; the window persists the
+    /// flat <see cref="DriveTreeCache"/> instead, because JsonUtility cannot serialize a
+    /// recursive type.</summary>
+    internal class DriveNode
+    {
+        public DriveFile file;
+        public DriveNode parent;         // null on the root; walked up for paths and ticks
+        public List<DriveNode> children; // null => never listed, empty => listed and empty
+        public bool expanded;
+        public bool loading;
+    }
+
+    /// <summary>The Drive tree flattened for Library/. Each file carries its parents, and
+    /// <see cref="known"/> records which folders were listed, so an empty folder comes back
+    /// as empty rather than as unexplored.</summary>
+    [Serializable]
+    internal class DriveTreeCache
+    {
+        public string rootId;
+        public DriveFile[] files;
+        public string[] known;
+    }
+
     /// <summary>
     /// Drive + GitHub hub. Tab 1: import/upload scripts & folders to/from Google
     /// Drive. Tab 2: list GitHub repos and add UPM packages by git URL.
@@ -34,12 +58,15 @@ namespace MyUnityHub
         GoogleDriveClient _drive;
         GitHubClient _github;
 
-        readonly SimpleCache<List<DriveFile>> _driveCache = new SimpleCache<List<DriveFile>>(60);
         readonly SimpleCache<List<Repo>> _repoCache = new SimpleCache<List<Repo>>(120);
 
-        List<DriveFile> _driveItems;
-        readonly HashSet<string> _selectedFiles = new HashSet<string>(); // file ids
-        string _selectedFolderId; // single-select folder
+        // Synthetic node standing for drive.rootFolderId; its children are the top level.
+        DriveNode _root;
+        // One tick set for files and folders alike. Ticking a folder ticks everything under
+        // it; unticking anything inside clears the folder's own tick, which leaves the
+        // folder "partial" - it still holds a selection, it just is not all of it.
+        readonly HashSet<string> _selected = new HashSet<string>();
+        readonly HashSet<string> _partial = new HashSet<string>(); // drawn as a dash
 
         List<Repo> _repos;
 
@@ -106,12 +133,7 @@ namespace MyUnityHub
 
         void LoadCachedLists()
         {
-            var d = ReadCache("driveItems");
-            if (!string.IsNullOrEmpty(d))
-            {
-                var w = JsonUtility.FromJson<DriveFileList>(d);
-                if (w?.files != null) _driveItems = w.files.ToList();
-            }
+            LoadCachedTree();
             var r = ReadCache("repos");
             if (!string.IsNullOrEmpty(r))
             {
@@ -120,8 +142,52 @@ namespace MyUnityHub
             }
         }
 
-        void SaveDriveItems() =>
-            WriteCache("driveItems", JsonUtility.ToJson(new DriveFileList { files = _driveItems.ToArray() }));
+        void SaveTree()
+        {
+            if (_root == null) return;
+            var files = new List<DriveFile>();
+            var known = new List<string>();
+            foreach (var n in AllNodes())
+            {
+                if (n != _root) files.Add(n.file);
+                if (n.children != null) known.Add(n.file.id);
+            }
+            WriteCache("driveTree", JsonUtility.ToJson(new DriveTreeCache
+            {
+                rootId = _root.file.id,
+                files = files.ToArray(),
+                known = known.ToArray(),
+            }));
+        }
+
+        void LoadCachedTree()
+        {
+            var json = ReadCache("driveTree");
+            if (string.IsNullOrEmpty(json)) return;
+            var c = JsonUtility.FromJson<DriveTreeCache>(json);
+            if (c == null || c.files == null || string.IsNullOrEmpty(c.rootId)) return;
+
+            var root = new DriveNode
+            {
+                file = new DriveFile { id = c.rootId, mimeType = DriveFile.FolderMimeType },
+            };
+            var byId = new Dictionary<string, DriveNode> { [c.rootId] = root };
+            foreach (var file in c.files) byId[file.id] = new DriveNode { file = file };
+            foreach (var id in c.known ?? new string[0])
+                if (byId.TryGetValue(id, out var n)) n.children = new List<DriveNode>();
+
+            // Re-hang each file under the parent it was listed from. A parent that was
+            // never listed has no children list, so nothing is dropped in the wrong place.
+            foreach (var file in c.files)
+                foreach (var p in file.parents ?? new string[0])
+                    if (byId.TryGetValue(p, out var parent) && parent.children != null)
+                    {
+                        byId[file.id].parent = parent;
+                        parent.children.Add(byId[file.id]);
+                        break;
+                    }
+            _root = root;
+        }
 
         void SaveRepos() =>
             WriteCache("repos", JsonUtility.ToJson(new RepoArrayWrap { items = _repos.ToArray() }));
@@ -447,7 +513,7 @@ namespace MyUnityHub
                 if (GUILayout.Button("Upload Folder...")) Defer(() => UploadLocal(folder: true));
             }
 
-            if (_driveItems == null)
+            if (_root?.children == null)
             {
                 EditorGUILayout.HelpBox(
                     "Set drive.rootFolderId in the credential file, then hit 'Refresh List'.",
@@ -455,33 +521,203 @@ namespace MyUnityHub
                 return;
             }
 
-            foreach (var f in Filter(_driveItems, f => f.name))
-            {
-                using (new EditorGUILayout.HorizontalScope())
-                {
-                    if (f.IsFolder)
-                    {
-                        bool on = _selectedFolderId == f.id;
-                        bool now = EditorGUILayout.ToggleLeft("📁 " + f.name, on);
-                        if (now != on) _selectedFolderId = now ? f.id : null; // radio
-                    }
-                    else
-                    {
-                        bool on = _selectedFiles.Contains(f.id);
-                        bool now = EditorGUILayout.ToggleLeft("📄 " + f.name, on);
-                        if (now && !on) _selectedFiles.Add(f.id);
-                        else if (!now && on) _selectedFiles.Remove(f.id);
-                    }
-                }
-            }
+            if (string.IsNullOrEmpty(_search))
+                foreach (var n in _root.children) DrawNode(n, 0);
+            else
+                // Search flattens the tree: a hit four folders deep is easier to act on as
+                // one row than as a path the user has to open by hand. Only what has been
+                // listed so far is searchable - unopened folders were never fetched.
+                foreach (var n in AllNodes())
+                    if (n != _root && Matches(n.file.name)) DrawRow(n, 0, arrow: false);
 
             EditorGUILayout.Space();
+            using (new EditorGUI.DisabledScope(_selected.Count == 0))
+                if (GUILayout.Button($"Import {_selected.Count} Selected Item(s)"))
+                    Defer(ImportSelected);
+        }
+
+        // ---- tree ----------------------------------------------------------
+
+        const float IndentStep = 14f;
+        const float ArrowWidth = 13f;
+
+        void DrawNode(DriveNode n, int depth)
+        {
+            DrawRow(n, depth, arrow: true);
+            if (n.expanded && n.children != null)
+                foreach (var c in n.children) DrawNode(c, depth + 1);
+        }
+
+        void DrawRow(DriveNode n, int depth, bool arrow)
+        {
+            var file = n.file;
             using (new EditorGUILayout.HorizontalScope())
             {
-                using (new EditorGUI.DisabledScope(_selectedFiles.Count == 0))
-                    if (GUILayout.Button($"Import {_selectedFiles.Count} File(s)")) Defer(ImportFiles);
-                using (new EditorGUI.DisabledScope(_selectedFolderId == null))
-                    if (GUILayout.Button("Import Selected Folder")) Defer(ImportFolder);
+                GUILayout.Space(depth * IndentStep);
+
+                // The arrow slot is reserved for every row so names stay aligned, but the
+                // triangle is only drawn for a folder that actually has something in it.
+                var slot = GUILayoutUtility.GetRect(ArrowWidth, ArrowWidth, GUILayout.Width(ArrowWidth));
+                if (arrow && CanExpand(n))
+                {
+                    bool open = EditorGUI.Foldout(slot, n.expanded, GUIContent.none, true);
+                    if (open != n.expanded)
+                    {
+                        n.expanded = open;
+                        if (open && NeedsReveal(n)) Defer(() => Reveal(n));
+                    }
+                }
+
+                string label = (file.IsFolder ? "📁 " : "📄 ") + file.name +
+                               (n.loading ? "  ..." : "");
+                bool on = _selected.Contains(file.id);
+
+                // A dash means "something inside is picked, but not the whole folder".
+                // Clicking it takes the whole folder, which is what the dash negates.
+                EditorGUI.showMixedValue = !on && _partial.Contains(file.id);
+                bool now = EditorGUILayout.ToggleLeft(label, on);
+                EditorGUI.showMixedValue = false;
+                if (now != on) Select(n, now);
+            }
+        }
+
+        /// <summary>A folder that was listed and came back empty gets no arrow; one that
+        /// has never been listed keeps its arrow, so a partial cache stays openable.</summary>
+        static bool CanExpand(DriveNode n) =>
+            n.file.IsFolder && (n.children == null || n.children.Count > 0);
+
+        static bool NeedsReveal(DriveNode n) =>
+            n.children == null || n.children.Any(c => c.file.IsFolder && c.children == null);
+
+        // ---- selection -----------------------------------------------------
+
+        /// <summary>Tick or untick a row and everything under it. Unticking also clears
+        /// every folder above, because a folder that is missing one child is no longer the
+        /// whole folder - and the import walks the ticked folders recursively.</summary>
+        void Select(DriveNode n, bool on)
+        {
+            Cascade(n, on);
+            if (!on)
+                for (var p = n.parent; p != null; p = p.parent) _selected.Remove(p.file.id);
+            RefreshPartial();
+        }
+
+        void Cascade(DriveNode n, bool on)
+        {
+            if (on) _selected.Add(n.file.id);
+            else _selected.Remove(n.file.id);
+            if (n.children != null)
+                foreach (var c in n.children) Cascade(c, on);
+        }
+
+        /// <summary>Hand a ticked folder's tick down to rows that only just arrived, so
+        /// opening a ticked folder never shows unticked children inside it.</summary>
+        void PropagateSelection(DriveNode from)
+        {
+            if (from.children == null) return;
+            bool on = _selected.Contains(from.file.id);
+            foreach (var c in from.children)
+            {
+                if (on) _selected.Add(c.file.id);
+                PropagateSelection(c);
+            }
+        }
+
+        /// <summary>Recomputed on change rather than per repaint: which folders hold a
+        /// selection without being selected themselves.</summary>
+        void RefreshPartial()
+        {
+            _partial.Clear();
+            foreach (var n in AllNodes())
+            {
+                if (!_selected.Contains(n.file.id)) continue;
+                // stops before the synthetic root: it is never drawn, so it can never
+                // be the folder wearing the dash
+                for (var p = n.parent; p != null && p.parent != null; p = p.parent)
+                    if (!_selected.Contains(p.file.id)) _partial.Add(p.file.id);
+            }
+        }
+
+        /// <summary>The topmost ticked rows. Anything below one of them is already covered:
+        /// a ticked folder is downloaded recursively, including the parts never listed.</summary>
+        IEnumerable<DriveNode> SelectionRoots() =>
+            AllNodes().Where(n => n != _root && _selected.Contains(n.file.id) &&
+                                  (n.parent == null || !_selected.Contains(n.parent.file.id)));
+
+        /// <summary>Where this row sits relative to the Drive root, excluding its own name.
+        /// Rebuilding that path under the target keeps a partial selection in shape and
+        /// keeps two same-named files from different folders apart.</summary>
+        static string RelDir(DriveNode n)
+        {
+            var parts = new List<string>();
+            for (var p = n.parent; p != null && p.parent != null; p = p.parent)
+                parts.Add(p.file.name);
+            parts.Reverse();
+            return parts.Count == 0 ? "" : Path.Combine(parts.ToArray());
+        }
+
+        IEnumerable<DriveNode> AllNodes()
+        {
+            if (_root == null) yield break;
+            var stack = new Stack<DriveNode>();
+            stack.Push(_root);
+            while (stack.Count > 0)
+            {
+                var n = stack.Pop();
+                yield return n;
+                // pushed back-to-front so the walk comes out in the order they are drawn
+                if (n.children != null)
+                    for (int i = n.children.Count - 1; i >= 0; i--) stack.Push(n.children[i]);
+            }
+        }
+
+        /// <summary>
+        /// Fill in what the tree does not know under this node: its own children if it was
+        /// never listed, plus the children of each subfolder one level down so their arrows
+        /// are right the moment they appear. Listing is metadata only - nothing is
+        /// downloaded until the user asks for an import.
+        /// </summary>
+        async Task<bool> Reveal(DriveNode n)
+        {
+            if (n.loading) return false;
+            n.loading = true;
+            SafeRepaint();
+            try
+            {
+                // Materialize the client on the main thread, then Task.Run: HttpClient's
+                // sync prelude (proxy/DNS) must stay off the main thread or the editor
+                // freezes.
+                var drive = Drive;
+                if (n.children == null)
+                {
+                    var listed = await Task.Run(() => drive.ListFolder(n.file.id));
+                    n.children = listed.Select(x => new DriveNode { file = x, parent = n }).ToList();
+                }
+
+                var need = n.children.Where(c => c.file.IsFolder && c.children == null)
+                                     .Select(c => c.file.id).ToList();
+                if (need.Count > 0)
+                {
+                    var map = await Task.Run(() => drive.ListChildren(need));
+                    foreach (var c in n.children)
+                        if (c.file.IsFolder && map.TryGetValue(c.file.id, out var kids))
+                            c.children = kids.Select(x => new DriveNode { file = x, parent = c }).ToList();
+                }
+
+                PropagateSelection(n);
+                RefreshPartial();
+                SaveTree(); // persist across editor restarts
+                return true;
+            }
+            catch (Exception e)
+            {
+                _status = "Drive error: " + e.Message;
+                return false;
+            }
+            finally
+            {
+                n.loading = false;
+                SafeRepaint();
             }
         }
 
@@ -494,103 +730,86 @@ namespace MyUnityHub
                 SafeRepaint();
                 return;
             }
+            if (force || _root == null || _root.file.id != rootId)
+            {
+                // A rebuilt tree invalidates every id the user had ticked.
+                _selected.Clear();
+                _partial.Clear();
+                _root = new DriveNode
+                {
+                    file = new DriveFile { id = rootId, mimeType = DriveFile.FolderMimeType },
+                };
+            }
             BeginBusy(0);
             try
             {
                 _status = "Listing Drive...";
-                if (force || !_driveCache.TryGet(rootId, out _driveItems))
-                {
-                    // Materialize the client on the main thread, then Task.Run:
-                    // HttpClient's sync prelude (proxy/DNS) must stay off the main
-                    // thread or the editor freezes.
-                    var drive = Drive;
-                    _driveItems = await Task.Run(() => drive.ListFolder(rootId));
-                    _driveCache.Set(rootId, _driveItems);
-                }
-                SaveDriveItems(); // persist across editor restarts
-                _status = $"{_driveItems.Count} item(s).";
+                if (await Reveal(_root)) _status = $"{_root.children.Count} item(s) at the top level.";
             }
-            catch (System.Exception e) { _status = "Drive error: " + e.Message; }
             finally { EndBusy(); }
         }
 
-        async Task ImportFiles()
+        /// <summary>
+        /// Download every ticked row into the target folder, rebuilt in the shape it has on
+        /// Drive. Only the topmost ticked rows are walked: a ticked folder is fetched
+        /// recursively by the client, which also picks up the parts that were never listed
+        /// in the window.
+        /// </summary>
+        async Task ImportSelected()
         {
             string dir = AskTargetDir();
             if (dir == null) return;
-            var picks = _driveItems.Where(f => _selectedFiles.Contains(f.id)).ToList();
+
+            var roots = SelectionRoots().ToList();
+            if (roots.Count == 0) { _status = "Nothing selected."; SafeRepaint(); return; }
 
             // conflict pass (main thread, before any network)
-            var jobs = new List<(DriveFile f, string path)>();
-            foreach (var f in picks)
+            var jobs = new List<(DriveFile file, string parentDir, string dest)>();
+            foreach (var n in roots)
             {
-                string path = Path.Combine(dir, f.name);
-                if (File.Exists(path))
+                string parentDir = Path.Combine(dir, RelDir(n));
+                string dest = Path.Combine(parentDir, n.file.name);
+                bool folder = n.file.IsFolder;
+                if (folder ? Directory.Exists(dest) : File.Exists(dest))
                 {
                     int c = EditorUtility.DisplayDialogComplex("Conflict",
-                        $"'{f.name}' already exists.", "Overwrite", "Cancel", "Skip");
-                    if (c == 1) return;     // Cancel whole batch
+                        folder
+                            ? $"Folder '{n.file.name}' already exists.\n\n" +
+                              "Overwrite: the existing folder is DELETED and downloaded again."
+                            : $"'{n.file.name}' already exists.",
+                        "Overwrite", "Cancel", "Skip");
+                    if (c == 1) return;     // Cancel the whole batch
                     if (c == 2) continue;   // Skip
+                    // A plain re-download would leave files that no longer exist on Drive.
+                    // DeleteAsset (not Directory.Delete) so the .meta files go too.
+                    if (folder && !AssetDatabase.DeleteAsset(ToAssetPath(dest)))
+                    {
+                        _status = "Could not delete the existing folder: " + dest;
+                        SafeRepaint();
+                        return;
+                    }
                 }
-                jobs.Add((f, path));
+                jobs.Add((n.file, parentDir, dest));
             }
             if (jobs.Count == 0) { _status = "Nothing to download."; SafeRepaint(); return; }
 
-            // batch: freeze compilation until all files land, then one import.
+            // batch: freeze compilation until everything lands, then one import.
             var drive = Drive;
             BeginBusy(jobs.Count);
             AssetDatabase.StartAssetEditing();
             try
             {
-                foreach (var (f, path) in jobs)
+                foreach (var (file, parentDir, dest) in jobs)
                 {
-                    _status = $"Downloading {_progDone + 1}/{jobs.Count}: {f.name}";
-                    await Task.Run(() => drive.DownloadFile(f.id, path));
+                    _status = $"Downloading {_progDone + 1}/{jobs.Count}: {file.name}";
+                    SafeRepaint();
+                    if (file.IsFolder) await Task.Run(() => drive.DownloadFolder(file, parentDir));
+                    else await Task.Run(() => drive.DownloadFile(file.id, dest));
                     _progDone++;
                 }
-                _status = $"{jobs.Count} file(s) imported.";
-                _selectedFiles.Clear();
-            }
-            catch (System.Exception e) { _status = "Download error: " + e.Message; }
-            finally
-            {
-                AssetDatabase.StopAssetEditing();
-                AssetDatabase.Refresh();
-                EndBusy();
-            }
-        }
-
-        async Task ImportFolder()
-        {
-            string dir = AskTargetDir();
-            if (dir == null) return;
-            var folder = _driveItems.First(f => f.id == _selectedFolderId);
-            string dest = Path.Combine(dir, folder.name);
-            if (Directory.Exists(dest))
-            {
-                int c = EditorUtility.DisplayDialogComplex("Conflict",
-                    $"Folder '{folder.name}' already exists.\n\n" +
-                    "Overwrite: the existing folder is DELETED and downloaded again.",
-                    "Overwrite", "Cancel", "Skip");
-                if (c != 0) { _status = "Cancelled/skipped."; SafeRepaint(); return; } // only overwrite
-                // A plain re-download would leave files that no longer exist on Drive.
-                // DeleteAsset (not Directory.Delete) so the .meta files go too.
-                if (!AssetDatabase.DeleteAsset(ToAssetPath(dest)))
-                {
-                    _status = "Could not delete the existing folder: " + dest;
-                    SafeRepaint();
-                    return;
-                }
-            }
-
-            var drive = Drive;
-            BeginBusy(0);
-            AssetDatabase.StartAssetEditing();
-            try
-            {
-                _status = $"Downloading folder: {folder.name}";
-                await Task.Run(() => drive.DownloadFolder(folder, dir));
-                _status = $"Folder imported: {folder.name}";
+                _status = $"{jobs.Count} item(s) imported.";
+                _selected.Clear();
+                _partial.Clear();
             }
             catch (System.Exception e) { _status = "Download error: " + e.Message; }
             finally
@@ -615,6 +834,7 @@ namespace MyUnityHub
                 : EditorUtility.OpenFilePanel("Upload File", Application.dataPath, "");
             if (string.IsNullOrEmpty(path)) return;
             var drive = Drive;
+            bool uploaded = false;
             BeginBusy(0);
             try
             {
@@ -622,10 +842,14 @@ namespace MyUnityHub
                 if (folder) await Task.Run(() => drive.UploadFolder(path, rootId));
                 else await Task.Run(() => drive.UploadFile(path, rootId));
                 _status = "Uploaded.";
-                _driveCache.Clear();
+                uploaded = true;
             }
             catch (System.Exception e) { _status = "Upload error: " + e.Message; }
             finally { EndBusy(); }
+
+            // Rebuilt outside the busy block so the two never nest. Costs the open/closed
+            // state of the tree, which is the honest price of a list that is now wrong.
+            if (uploaded) await LoadDrive(force: true);
         }
 
         // ===================================================================
@@ -702,7 +926,7 @@ namespace MyUnityHub
         // Buttons fire inside OnGUI. Anything that opens a file panel or a modal dialog
         // must not run in the middle of a Layout/Repaint pass, so the operation starts on
         // the next editor tick instead.
-        static void Defer(System.Func<Task> op) => EditorDispatcher.Enqueue(() => _ = op());
+        static void Defer(Func<Task> op) => EditorDispatcher.Enqueue(() => _ = op());
 
         static string Norm(string p) => p.Replace('\\', '/').TrimEnd('/');
 
@@ -726,11 +950,15 @@ namespace MyUnityHub
             return dir;
         }
 
-        IEnumerable<T> Filter<T>(IEnumerable<T> src, System.Func<T, string> name)
+        IEnumerable<T> Filter<T>(IEnumerable<T> src, Func<T, string> name)
         {
             if (string.IsNullOrEmpty(_search)) return src;
-            return src.Where(x => name(x).IndexOf(_search, System.StringComparison.OrdinalIgnoreCase) >= 0);
+            return src.Where(x => Matches(name(x)));
         }
+
+        bool Matches(string name) =>
+            string.IsNullOrEmpty(_search) ||
+            name.IndexOf(_search, StringComparison.OrdinalIgnoreCase) >= 0;
 
         static string SearchField(string val)
         {
