@@ -104,3 +104,13 @@ that folder just forces a refresh.
 Package name: `com.heatinteractive.myunityhub`. Add it via Package Manager ▸
 *Add package from git URL* with this repo's git URL, or copy the folder into the
 target project's `Packages/`.
+
+## License
+[Functional Source License 1.1 with an MIT future grant](LICENSE.md) (`FSL-1.1-MIT`).
+
+In plain terms: use it in anything, including commercial projects, and modify it
+freely. What you may not do is turn around and sell MyUnityHub itself, or ship a
+product that substitutes for it. Two years after a version is published, that version
+becomes plain MIT.
+
+This is a source-available licence, not an OSI-approved open source one.
